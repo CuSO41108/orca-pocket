@@ -1,0 +1,10 @@
+# 本地真实配置（含个人 open_id），不入库
+*.pyc
+.venv/
+__pycache__/
+config.json
+config.local.json
+logs/
+privacy.local.txt
+state.json
+state.json.tmp

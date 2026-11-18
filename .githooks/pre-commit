@@ -1,0 +1,4 @@
+#!/bin/sh
+# Blocks a commit that would publish personal identifiers.
+# Enable once with:  git config core.hooksPath .githooks
+exec python "$(git rev-parse --show-toplevel)/check_privacy.py"

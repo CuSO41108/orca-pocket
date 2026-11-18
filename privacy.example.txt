@@ -1,0 +1,5 @@
+# 复制为 privacy.local.txt 后填入自己的隐私词（一行一个）
+# privacy.local.txt 已被 .gitignore 忽略，不会被提交
+your-real-name
+your-username
+your-project-name

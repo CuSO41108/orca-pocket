@@ -1,0 +1,9 @@
+{
+  "allowed_open_ids": [
+    "<YOUR_OPEN_ID>"
+  ],
+  "max_reply_chars": 4000,
+  "event_key": "im.message.receive_v1",
+  "log_file": "logs/bridge.log",
+  "log_level": "INFO"
+}
