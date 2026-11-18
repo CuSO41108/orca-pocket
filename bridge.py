@@ -302,8 +302,8 @@ HELP = """\
 
 **这样问**
 「现在什么情况」
-「myapp 在干嘛」
-「让 my-video 继续」
+「<会话名> 在干嘛」
+「让 <会话名> 继续」
 「接下来 30 分钟我说什么都照做」
 
 **命令（逃生阀，日常不用记）**
@@ -468,7 +468,7 @@ class Bridge:
         self.undelivered: list[dict] = []
         self.cards_available = True
         self._watch_baselined = False
-        self._dirty_cache: dict[str, tuple[float, list[str] | None]] = {}
+        self._dirty_cache: dict[str, tuple[float, tuple[str, list[str]]]] = {}
         self.pending_ttl = float(cfg.get("pending_ttl_seconds", 300))
         self.llm = LLM(cfg.get("llm") or {})
         self.load_state()
@@ -1102,19 +1102,18 @@ class Bridge:
             out.extend(alerts)
         return "\n".join(out).rstrip()
 
-    def _changed_files(self, path: str, ttl: float = 10.0) -> list[str] | None:
-        """Uncommitted files, from git — a fact, not a screen scrape.
+    def _changed_files(self, path: str, ttl: float = 10.0) -> tuple[str, list[str]]:
+        """Return (state, files) where state is git | not_git | error.
 
-        Cached briefly: a status card touches every visible session and each
-        check spawns a git process, which is slow enough on Windows to be
-        noticeable when asking twice in a row.
+        A folder workspace has no repository at all; that is a different thing
+        from a failing git call, and saying "读不到" for it reads like a bug.
         """
         if not path:
-            return None
+            return "error", []
         hit = self._dirty_cache.get(path)
         if hit and time.time() - hit[0] < ttl:
             return hit[1]
-        result: list[str] | None
+        result: tuple[str, list[str]]
         try:
             res = subprocess.run(
                 ["git", "-c", "core.quotepath=false", "-C", path,
@@ -1125,19 +1124,20 @@ class Bridge:
                 errors="replace",
                 timeout=10,
             )
-            result = (
-                [line[3:].strip() for line in res.stdout.splitlines() if len(line) > 3]
-                if res.returncode == 0
-                else None
-            )
+            if res.returncode == 0:
+                result = ("git", [line[3:].strip() for line in res.stdout.splitlines() if len(line) > 3])
+            elif "not a git repository" in (res.stderr or "").lower():
+                result = ("not_git", [])
+            else:
+                result = ("error", [])
         except (OSError, subprocess.TimeoutExpired):
-            result = None
+            result = ("error", [])
         self._dirty_cache[path] = (time.time(), result)
         return result
 
     def _dirty_badge(self, path: str) -> str:
-        files = self._changed_files(path)
-        return f"{len(files)} 未提交" if files else ""
+        state, files = self._changed_files(path)
+        return f"{len(files)} 未提交" if state == "git" and files else ""
 
     def cmd_ask(self, name: str | None) -> str:
         """Report facts about a session.
@@ -1164,19 +1164,24 @@ class Bridge:
                 return err
 
         lines = [f"**{s.short}** · {'在跑' if s.busy else '空闲'} · {repo_of(s.label)}"]
+        all_sessions = self.sessions()
+        busy_count = sum(1 for x in all_sessions if x.busy)
+        lines.append(f"全局：{busy_count} 个在跑 · {len(all_sessions) - busy_count} 个空闲")
         lines.append(f"最近活动：{fmt_age(s.last_output_at) or '—'}")
         if s.branch:
             lines.append(f"分支：`{s.branch}`")
-        files = self._changed_files(s.path)
-        if files is None:
-            lines.append("未提交改动：读不到")
-        elif not files:
-            lines.append("未提交改动：无")
+        state, files = self._changed_files(s.path)
+        if state == "git":
+            if not files:
+                lines.append("未提交改动：无")
+            else:
+                shown = "、".join(f"`{f}`" for f in files[:3])
+                more = f" 等 {len(files)} 个" if len(files) > 3 else ""
+                lines.append(f"未提交改动：{len(files)} 个文件（{shown}{more}）")
+        elif state == "not_git":
+            lines.append("目录：不是 git 仓库")
         else:
-            shown = "、".join(f"`{f}`" for f in files[:3])
-            more = f" 等 {len(files)} 个" if len(files) > 3 else ""
-            lines.append(f"未提交改动：{len(files)} 个文件（{shown}{more}）")
-        lines.append("\n_这是事实，不是摘要。想看它在想什么需要开 AI 摘要。_")
+            lines.append("未提交改动：读不到")
         return "\n".join(lines)
 
     def cmd_say(self, session_name: str | None, text: str) -> str | Reply:
@@ -1477,8 +1482,8 @@ class Bridge:
         return (
             "没太听懂。可以试试：\n"
             "「现在什么情况」\n"
-            "「myapp 在干嘛」\n"
-            "「让 my-video 继续」\n\n"
+            "「<会话名> 在干嘛」\n"
+            "「让 <会话名> 继续」\n\n"
             "`/help` 看全部命令。"
         )
 
