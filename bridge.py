@@ -21,9 +21,13 @@ Test: python bridge.py --selftest
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import queue
+import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -33,6 +37,11 @@ import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
+
+import router
+from llm import LLM, LLMError
+
+import cards as cards_mod
 
 READY_MARKER = "[event] ready event_key="
 DEFAULT_EVENT_KEY = "im.message.receive_v1"
@@ -212,13 +221,22 @@ class EventConsumer:
 class Reply:
     """A reply plus how to render it.
 
-    markdown=True goes out as a `post` message with an `md` block, which gives
-    us bold headings and paragraph breaks. On a phone-width screen that is the
-    difference between a scannable list and a wall of wrapped text.
+    markdown=True goes out as a `post` message with an `md` block. A `card`
+    wins over both: it is an interactive card, which is the only form the
+    phone can act on without typing.
     """
 
     text: str
     markdown: bool = False
+    card: dict | None = None
+
+
+def _reply_card(card: dict, fallback: str = "") -> Reply:
+    return Reply(fallback, card=card)
+
+
+def as_reply(out) -> Reply:
+    return out if isinstance(out, Reply) else Reply(out, markdown=True)
 
 
 def send_reply(
@@ -243,28 +261,55 @@ def send_reply(
     return True
 
 
+def send_card(
+    cmd: list[str],
+    card: dict,
+    *,
+    message_id: str | None = None,
+    chat_id: str | None = None,
+    idempotency: str | None = None,
+) -> bool:
+    """Send an interactive card, as a reply or as a new message."""
+    if message_id:
+        args = ["im", "+messages-reply", "--as", "bot", "--message-id", message_id]
+    elif chat_id:
+        args = ["im", "+messages-send", "--as", "bot", "--chat-id", chat_id]
+    else:
+        return False
+
+    args += ["--msg-type", "interactive", "--content", json.dumps(card, ensure_ascii=False), "--json"]
+    if idempotency:
+        args += ["--idempotency-key", idempotency]
+
+    try:
+        res = run_lark(cmd, args)
+    except Exception as exc:  # timeout / OSError / anything the CLI shells into
+        log.error("card send raised: %s", exc)
+        return False
+    if res.returncode != 0:
+        log.error("card send failed rc=%s %s", res.returncode, (res.stderr or "").strip()[:400])
+        return False
+    log.info("sent card (%d bytes)", len(json.dumps(card)))
+    return True
+
+
 # --------------------------------------------------------------------------
 # routing
 # --------------------------------------------------------------------------
 
 HELP = """\
-**Feishu ⇄ Orca** · 里程碑 3
+**Feishu ⇄ Orca** · 直接说话就行
 
-**会话**
-`/sessions` 有哪些 agent 会话、谁在跑
-`/to myapp 跑一下测试` 点名发给某个会话
-`/send 继续` 发给当前焦点会话
+**这样问**
+「现在什么情况」
+「myapp 在干嘛」
+「让 my-video 继续」
+「接下来 30 分钟我说什么都照做」
 
-**看**
-`/tail` 读焦点会话最后输出
-`/wt` workspace
-`/term` 终端（调试用）
-
-**闸门**
-`/arm` 解锁写操作 5 分钟
-`/disarm` 立刻上锁
-
-`/ping` `/id` `/help`"""
+**命令（逃生阀，日常不用记）**
+`/status` `/sessions` `/tail` `/wt` `/term`
+`/arm` `/disarm` `/send` `/to` `/use`
+`/id` `/help`"""
 
 
 def normalize(text: str) -> str:
@@ -283,6 +328,16 @@ def normalize(text: str) -> str:
                 continue
         break
     return text
+
+
+def event_key(raw: str) -> str:
+    """A stable, bounded idempotency key.
+
+    Feishu rejects keys longer than 50 characters, and a raw
+    `done:<paneKey>:<ts>` is ~89 with real UUID pane keys — which silently
+    turned every completion notification into a validation failure.
+    """
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:40]
 
 
 def fmt_age(ts_ms) -> str:
@@ -313,6 +368,30 @@ def mask(value: str, keep: int = 10) -> str:
     if not value:
         return "-"
     return value if len(value) <= keep + 3 else f"{value[:keep]}…"
+
+
+# Agent TUIs repaint: spinners, token counters and box drawing arrive as
+# stacked fragments rather than a picture of the screen. Dropping those leaves
+# something a person can actually read on a phone.
+_TUI_NOISE = re.compile(
+    r"(tokens?\s*·|thought for|\(ctrl\+[a-z] to expand\)|^\s*[●○✢✻✽·⎿─┌└├│╭╰]|^\s*\.\.\.\s*\+\d+\s+lines)"
+)
+
+
+def clean_preview(text: str, limit: int = 12) -> str:
+    lines = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if _TUI_NOISE.search(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines[-limit:])
+
+
+def repo_of(label: str) -> str:
+    return (label or "").split(" · ")[0]
 
 
 def trim_tail(lines: list[str], budget: int) -> str:
@@ -355,6 +434,12 @@ class Session:
     short: str
     state: str
     connected: bool
+    last_output_at: int | None = None
+    preview: str = ""
+    path: str = ""
+    branch: str = ""
+    agent: str = ""
+    incarnation: str = ""
 
     @property
     def busy(self) -> bool:
@@ -372,7 +457,20 @@ class Bridge:
         self.armed_until = 0.0
         self.default_term: int | None = None
         self.focus_key: str | None = None
+        self.chat_id: str | None = None
+        self.chat_owner: str | None = None
+        self.watch: dict = {}
+        self._state_lock = threading.RLock()
         self.stale_note = ""
+        self._session_cache: list[Session] | None = None
+        self.pending: dict[str, dict] = {}
+        self.recent_resolved: dict[str, dict] = {}
+        self.undelivered: list[dict] = []
+        self.cards_available = True
+        self._watch_baselined = False
+        self._dirty_cache: dict[str, tuple[float, list[str] | None]] = {}
+        self.pending_ttl = float(cfg.get("pending_ttl_seconds", 300))
+        self.llm = LLM(cfg.get("llm") or {})
         self.load_state()
 
     # -- focus persistence ------------------------------------------------
@@ -395,18 +493,31 @@ class Bridge:
             log.warning("state file unreadable, starting fresh: %s", path)
             return
         self.focus_key = data.get("focus_key") or None
+        self.chat_id = data.get("chat_id") or None
+        self.chat_owner = data.get("chat_owner") or None
+        self.watch = data.get("watch") or {}
         if self.focus_key:
             log.info("restored focus: %s", mask(str(self.focus_key)))
 
     def save_state(self) -> None:
-        path = self._state_path()
-        payload = {"focus_key": self.focus_key, "updated_at": int(time.time())}
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        try:
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(path)  # atomic-ish: never leave a half-written file
-        except OSError as exc:
-            log.warning("could not persist focus: %s", exc)
+        # The watchdog thread and the message thread both persist state.
+        # Without the lock they interleave on the same temp path: one can
+        # overwrite the other's newer snapshot.
+        with self._state_lock:
+            path = self._state_path()
+            payload = {
+                "focus_key": self.focus_key,
+                "chat_id": self.chat_id,
+                "chat_owner": self.chat_owner,
+                "watch": self.watch,
+                "updated_at": int(time.time()),
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            try:
+                tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp.replace(path)  # atomic-ish: never leave a half-written file
+            except OSError as exc:
+                log.warning("could not persist state: %s", exc)
 
     def _already_seen(self, message_id: str) -> bool:
         if not message_id:
@@ -485,12 +596,14 @@ class Bridge:
     def _terminals(self) -> list[dict]:
         return self.orca(["terminal", "list", "--json"]).get("terminals") or []
 
-    def sessions(self) -> list[Session]:
+    def sessions(self, fresh: bool = False) -> list[Session]:
         """Join agent sessions onto their terminal handles.
 
         Busy first, then alphabetical — the list is a supervision queue, not
         an inventory.
         """
+        if not fresh and self._session_cache is not None:
+            return self._session_cache
         wts = self.orca(["worktree", "ps", "--json"]).get("worktrees") or []
         by_pane = {}
         for t in self._terminals():
@@ -514,18 +627,32 @@ class Bridge:
                         short=short,
                         state=a.get("state") or "?",
                         connected=bool(t.get("connected")),
+                        last_output_at=t.get("lastOutputAt"),
+                        preview=t.get("preview") or "",
+                        path=(w.get("path") or "").replace("\\", "/"),
+                        branch=(w.get("branch") or "").replace("refs/heads/", ""),
+                        agent=t.get("agentIdentity") or "",
+                        incarnation=t.get("incarnationId") or "",
                     )
                 )
-        out.sort(key=lambda s: (not s.busy, s.label))
-        # Two agent tabs in the same worktree share a basename, which makes
-        # them indistinguishable both to the router and to the person reading
-        # the list. Suffix the later ones.
+        # Aliases must be stable: assigning `#n` after the busy-first sort made
+        # a pane's name change when a sibling finished, so a follow-up message
+        # quoting that name could address a different agent. Number by pane key
+        # first, then sort for display.
+        out.sort(key=lambda s: (s.short, s.key))
         seen: dict[str, int] = {}
         for s in out:
             n = seen.get(s.short, 0) + 1
             seen[s.short] = n
             if n > 1:
                 s.short = f"{s.short}#{n}"
+        out.sort(key=lambda s: (not s.busy, s.label))
+        # A fresh read belongs to the caller alone. Writing it into the shared
+        # cache let a watchdog tick replace the list that an in-flight message
+        # was still routing against, which could retarget a write to a
+        # neighbouring terminal (name vs name#2 swap).
+        if not fresh:
+            self._session_cache = out
         return out
 
     def cmd_sessions(self) -> str:
@@ -604,22 +731,200 @@ class Bridge:
         self.save_state()
         return self._write_to(hits[0], text)
 
+    def _send_text(self, handle: str, text: str) -> str:
+        data = self.orca(
+            ["terminal", "send", "--terminal", handle, "--text", text,
+             "--enter", "--wait-submit", "8", "--json"]
+        )
+        stages = ((data.get("send") or {}).get("prompt") or {}).get("stages") or []
+        return "已提交" if "turn_started" in stages else "已送达（未确认开始执行）"
+
     def _write_to(self, s: Session, text: str) -> str:
         if not text.strip():
             return "文本为空。"
         if not s.connected:
             return f"{s.short} 的终端未连接，拒绝发送。"
-        argv = ["terminal", "send", "--terminal", s.handle, "--text", text, "--enter"]
-        argv += ["--wait-submit", "8", "--json"]
-        data = self.orca(argv)
-        send = data.get("send") or {}
-        stages = (send.get("prompt") or {}).get("stages") or []
-        proof = "已提交" if "turn_started" in stages else "已送达（未确认开始执行）"
+        proof = self._send_text(s.handle, text)
         return (
             f"→ **{shorten(s.short, 18)}**\n{proof}\n\n"
             f"> {shorten(text, 300)}\n\n"
             f"`/tail` 看它的输出"
         )
+
+    # -- confirmation ------------------------------------------------------
+    #
+    # Writing into a live agent cannot be undone, so the default path asks
+    # first: a card with what will be sent and to whom, and two buttons.
+    # `/arm` stays as the "I'm busy, stop asking" escape hatch.
+
+    def _live_target(self, sess: Session) -> Session | None:
+        """Re-read the session and require it to still be the same thing.
+
+        Routing can take seconds (the model call); the pane may have been
+        closed or handed to a different agent in that time.
+        """
+        live = next((s for s in self.sessions(fresh=True) if s.key == sess.key), None)
+        if (live is None or not live.connected or live.handle != sess.handle
+                or live.agent != sess.agent or live.incarnation != sess.incarnation):
+            return None
+        return live
+
+    def _request_write(self, sess: Session, text: str) -> Reply:
+        if time.time() < self.armed_until or not self.cfg.get("confirm_writes", True):
+            live = self._live_target(sess)
+            if live is None:
+                return Reply("⚠️ 目标会话在路由期间变了，没有发送。请再发一次。", markdown=True)
+            return Reply(self._write_to(live, text), markdown=True)
+
+        if len(text) > 2000:
+            # What the operator approves must be exactly what executes, so an
+            # instruction too long to show in full cannot go through a card.
+            # This limit belongs here, not above the armed bypass.
+            return Reply(
+                "指令太长（超过 2000 字），没法在卡片里完整展示，拒绝执行。\n"
+                "请缩短，或用 `/arm` 解锁后直接发。",
+                markdown=True,
+            )
+
+        if not self.cards_available:
+            # Without a callback listener the buttons would never fire, so
+            # offering them would be a dead end.
+            return Reply(
+                "🔒 写操作需要确认，但卡片回调没有启用。先 `/arm` 解锁，"
+                "或检查 `enable_cards` 与飞书后台的回调配置。",
+                markdown=True,
+            )
+
+        # 64 bits, and expired entries are pruned first. A short id with a
+        # leaky pending map would eventually collide and make an old card
+        # execute a different action than the one it displayed.
+        now = time.time()
+        for stale in [k for k, v in self.pending.items() if now - v["created"] > self.pending_ttl]:
+            self.pending.pop(stale, None)
+
+        pid = secrets.token_hex(8)
+        while pid in self.pending:
+            pid = secrets.token_hex(8)
+        self.pending[pid] = {
+            "key": sess.key,
+            "agent": sess.agent,
+            "incarnation": sess.incarnation,
+            "short": sess.short,
+            "handle": sess.handle,
+            "text": text,
+            "created": now,
+        }
+        body = f"发给 **{sess.short}**"
+        return _reply_card(
+            # The full, untruncated instruction: approving a shortened
+            # rendering would mean approving something other than what runs.
+            cards_mod.confirm(pid, "等你确认", body, subtitle=sess.label, detail=text),
+            fallback="⚠️ 确认卡片没发出去，操作没有执行。用 `/arm` 解锁后直接发，或稍后再试一次。",
+        )
+
+    def handle_card(self, ev: dict) -> None:
+        operator = ev.get("operator_id") or ""
+        if not self.authorized(operator):
+            log.warning("card action from unauthorized operator %s", mask(operator))
+            return
+
+        raw = ev.get("action_value")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except json.JSONDecodeError:
+            log.warning("card action with unparseable value: %r", str(raw)[:120])
+            return
+        if data.get("op") != "confirm":
+            return
+
+        token = ev.get("token")
+        pid = str(data.get("pid") or "")
+        choice = data.get("choice")
+        log.info("card action pid=%s choice=%s operator=%s", pid, choice, mask(operator))
+
+        pending = self.pending.pop(pid, None)
+        if not pending:
+            # A double click must not overwrite the result the first click
+            # already produced.
+            previous = self.recent_resolved.get(pid)
+            self._update_card(
+                token,
+                previous or cards_mod.resolved("已失效", "这个确认已经处理过了。", template="grey"),
+            )
+            return
+        if time.time() - pending["created"] > self.pending_ttl:
+            self._update_card(token, cards_mod.resolved("已过期", "确认超时，没有执行。", template="grey"), pid)
+            return
+
+        target = pending["short"]
+        if choice != "yes":
+            self._update_card(token, cards_mod.resolved("已取消", f"没有发给 **{target}**。", template="grey"), pid)
+            return
+
+        # The confirmation window is minutes long. The pane may have closed or
+        # been repurposed since, and the stored handle could now address a
+        # different process. Require the same session, still connected, still
+        # owning that handle.
+        try:
+            live = next((s for s in self.sessions(fresh=True) if s.key == pending.get("key")), None)
+        except Exception:
+            # A transient orca failure must not eat the approval: put it back
+            # so the same button works on the next click.
+            self.pending[pid] = pending
+            log.exception("could not verify the target; confirmation kept for retry")
+            return
+        if (live is None or not live.connected or live.handle != pending["handle"]
+                or live.agent != pending.get("agent", live.agent)
+                or live.incarnation != pending.get("incarnation", live.incarnation)):
+            # Three cheap identities have to agree: the handle, the agent type,
+            # and the PTY incarnation. Exiting one agent and starting another
+            # in the same pane keeps the handle; restarting the pane changes
+            # the incarnation. What we still cannot see is a *conversation*
+            # id inside an unchanged pane — Orca does not expose one — so the
+            # remaining window is one agent type, restarted, inside the TTL.
+            self._update_card(
+                token,
+                cards_mod.resolved("目标已变化", f"**{target}** 已经不是原来那个会话了，没有发送。", template="grey"),
+                pid,
+            )
+            return
+
+        try:
+            proof = self._send_text(live.handle, pending["text"])
+        except Exception as exc:
+            log.exception("confirmed write failed")
+            self._update_card(
+                token,
+                cards_mod.resolved("执行失败", shorten(str(exc), 300), template="red"),
+                pid,
+            )
+            return
+
+        self._update_card(
+            token,
+            cards_mod.resolved(
+                "已发送",
+                f"→ **{target}**\n{proof}",
+                template="green",
+                detail=pending["text"],
+            ),
+            pid,
+        )
+
+    def _update_card(self, token: str | None, card: dict, pid: str | None = None) -> None:
+        if pid:
+            self.recent_resolved[pid] = card
+            while len(self.recent_resolved) > 50:
+                self.recent_resolved.pop(next(iter(self.recent_resolved)))
+        if not token:
+            return
+        payload = json.dumps({"token": token, "card": card}, ensure_ascii=False)
+        res = run_lark(
+            self.cmd,
+            ["api", "POST", "/open-apis/interactive/v1/card/update", "--as", "bot", "--data", payload],
+        )
+        if res.returncode != 0:
+            log.warning("card update failed: %s", (res.stderr or "").strip()[:300])
 
     def cmd_term(self) -> str:
         terms = self._terminals()
@@ -711,21 +1016,22 @@ class Bridge:
             return None, None, f"编号超出范围：1..{len(terms)}"
         return terms[n - 1], n, None
 
-    def cmd_send(self, arg: str) -> str:
+    def cmd_send(self, arg: str) -> str | Reply:
         """The only irreversible operation in this bridge.
 
-        Two gates before anything reaches a PTY: an explicit `/arm` window,
-        and a resolved target we echo back. A bare `/send` goes to the focus
-        session, never to "whatever looked closest".
+        The default path asks for confirmation with a card; `/arm` skips the
+        asking for a window. A bare `/send` goes to the focus session, never
+        to "whatever looked closest".
         """
-        if time.time() >= self.armed_until:
-            return "🔒 写操作上锁中。先 `/arm` 解锁（默认 5 分钟）。"
         if not arg.strip():
             return "`/send <文本>` 或 `/send <编号> <文本>`"
 
         parts = arg.split(None, 1)
         if parts[0].isdigit():
-            # Debug escape hatch: address a raw terminal by index.
+            # Debug escape hatch: address a raw terminal by index. Kept behind
+            # /arm because it bypasses the confirmation card entirely.
+            if time.time() >= self.armed_until:
+                return "🔒 按编号发送是调试通道，需要先 `/arm`。"
             term, idx, err = self._resolve_target(int(parts[0]))
             if err:
                 return err
@@ -748,7 +1054,333 @@ class Bridge:
         if self.focus_key != sess.key:
             self.focus_key = sess.key
             self.save_state()
-        return self.stale_note + self._write_to(sess, arg)
+        out = self._request_write(sess, arg)
+        if isinstance(out, Reply) and self.stale_note:
+            out.text = self.stale_note + out.text
+        return out
+
+    # -- the supervision surface ------------------------------------------
+    #
+    # Everything below is what a person actually sees. It is deliberately
+    # rule-driven: status is assembled from structured fields, never parsed
+    # out of terminal text. The model is only consulted for "what did they
+    # mean", never for "what is true".
+
+    def _alerts(self) -> list[str]:
+        wts = self.orca(["worktree", "ps", "--json"]).get("worktrees") or []
+        out = []
+        for w in wts:
+            pr = w.get("linkedPR") or {}
+            checks = pr.get("checksSummary") or {}
+            if checks.get("state") == "failure":
+                ratio = ""
+                if checks.get("total"):
+                    ratio = f"（{checks.get('passed', 0)}/{checks.get('total')}）"
+                out.append(f"⚠ {w.get('repo')} PR#{pr.get('number')} CI 失败{ratio}")
+        return out
+
+    def cmd_status(self) -> str:
+        ss = self.sessions()
+        alerts = self._alerts()
+        if not ss:
+            # A worktree can keep a linked PR with failing CI after all its
+            # agent terminals close; that is exactly when the alert matters.
+            return "\n".join(["没有 agent 会话。"] + ([""] + alerts if alerts else []))
+        busy = [s for s in ss if s.busy]
+        idle = [s for s in ss if not s.busy]
+        out = [f"**{len(busy)} 个在跑** · {len(idle)} 个空闲", ""]
+        for s in busy:
+            out.append(f"● **{s.short}** · {repo_of(s.label)} · {fmt_age(s.last_output_at)}")
+        for s in idle[:5]:
+            badge = self._dirty_badge(s.path)
+            line = f"○ {s.short} · {fmt_age(s.last_output_at) or '—'}"
+            out.append(f"{line} · **{badge}**" if badge else line)
+        if len(idle) > 5:
+            out.append(f"…还有 {len(idle) - 5} 个空闲")
+        if alerts:
+            out.append("")
+            out.extend(alerts)
+        return "\n".join(out).rstrip()
+
+    def _changed_files(self, path: str, ttl: float = 10.0) -> list[str] | None:
+        """Uncommitted files, from git — a fact, not a screen scrape.
+
+        Cached briefly: a status card touches every visible session and each
+        check spawns a git process, which is slow enough on Windows to be
+        noticeable when asking twice in a row.
+        """
+        if not path:
+            return None
+        hit = self._dirty_cache.get(path)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+        result: list[str] | None
+        try:
+            res = subprocess.run(
+                ["git", "-c", "core.quotepath=false", "-C", path,
+                 "status", "--porcelain", "--untracked-files=all"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            result = (
+                [line[3:].strip() for line in res.stdout.splitlines() if len(line) > 3]
+                if res.returncode == 0
+                else None
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        self._dirty_cache[path] = (time.time(), result)
+        return result
+
+    def _dirty_badge(self, path: str) -> str:
+        files = self._changed_files(path)
+        return f"{len(files)} 未提交" if files else ""
+
+    def cmd_ask(self, name: str | None) -> str:
+        """Report facts about a session.
+
+        Deliberately does NOT quote the terminal. Doing so turned every
+        "what is it doing" into a mirror: asking about the session that is
+        currently answering you returns your own last message verbatim, and
+        asking about any other session returns repainted TUI fragments.
+        Facts here are structured, cheap, and cannot be misread.
+        """
+        ss = self.sessions()
+        if not ss:
+            return "没有 agent 会话。"
+        if name:
+            hits = self._match_sessions(name)
+            if not hits:
+                return f"没找到 `{name}`。"
+            if len(hits) > 1:
+                return "匹配到多个：" + "、".join(f"`{s.short}`" for s in hits)
+            s = hits[0]
+        else:
+            s, err = self._focus_session()
+            if err:
+                return err
+
+        lines = [f"**{s.short}** · {'在跑' if s.busy else '空闲'} · {repo_of(s.label)}"]
+        lines.append(f"最近活动：{fmt_age(s.last_output_at) or '—'}")
+        if s.branch:
+            lines.append(f"分支：`{s.branch}`")
+        files = self._changed_files(s.path)
+        if files is None:
+            lines.append("未提交改动：读不到")
+        elif not files:
+            lines.append("未提交改动：无")
+        else:
+            shown = "、".join(f"`{f}`" for f in files[:3])
+            more = f" 等 {len(files)} 个" if len(files) > 3 else ""
+            lines.append(f"未提交改动：{len(files)} 个文件（{shown}{more}）")
+        lines.append("\n_这是事实，不是摘要。想看它在想什么需要开 AI 摘要。_")
+        return "\n".join(lines)
+
+    def cmd_say(self, session_name: str | None, text: str) -> str | Reply:
+        """Natural-language send: same gates as /send, no slash required."""
+        if not text.strip():
+            return "没听清要发什么。"
+        if session_name:
+            hits = self._match_sessions(session_name)
+            if not hits:
+                return f"没找到 `{session_name}`。"
+            if len(hits) > 1:
+                return "匹配到多个：" + "、".join(f"`{s.short}`" for s in hits)
+            sess = hits[0]
+        else:
+            sess, err = self._focus_session()
+            if err:
+                return err
+        self.focus_key = sess.key
+        self.save_state()
+        out = self._request_write(sess, text)
+        if isinstance(out, Reply) and self.stale_note:
+            out.text = self.stale_note + out.text
+        return out
+
+    # -- proactive notifications -------------------------------------------
+    #
+    # Only transitions are worth interrupting someone for, and only ones we
+    # can read off structured fields. "Stuck" is deliberately not detected:
+    # a long-running render and a hung agent look identical from the outside,
+    # and a notifier that cries wolf gets muted.
+
+    def _ci_states(self) -> dict[str, str]:
+        wts = self.orca(["worktree", "ps", "--json"]).get("worktrees") or []
+        out: dict[str, str] = {}
+        for w in wts:
+            pr = w.get("linkedPR") or {}
+            number = pr.get("number")
+            if not number:
+                continue
+            state = (pr.get("checksSummary") or {}).get("state")
+            if state:
+                out[f"{w.get('repo')}#{number}"] = state
+        return out
+
+    def poll_once(self) -> list[dict]:
+        """One watchdog tick. Returns what should be pushed."""
+        now = time.time()
+        sessions = self.sessions(fresh=True)
+
+        # Snapshot CI before mutating anything. If this call fails after the
+        # session loop already advanced `self.watch`, the completion event it
+        # collected is thrown away and the next tick sees no transition —
+        # the notification is lost forever.
+        ci = self._ci_states()
+
+        # First tick after start establishes a baseline and emits nothing.
+        # Persisted state describes the *previous* process: if an agent
+        # finished while we were down, replaying it as a fresh completion
+        # would also report the downtime as its duration.
+        with self._state_lock:
+            return self._poll_locked(sessions, ci, now)
+
+    def _poll_locked(self, sessions: list[Session], ci: dict[str, str], now: float) -> list[dict]:
+        events: list[dict] = []
+        changed = False
+
+        if not self._watch_baselined:
+            # Replace, don't merge. A merged baseline keeps entries for panes
+            # that are gone right now; if one reappears as done, the old
+            # process's completion gets replayed with a bogus duration.
+            self.watch = {
+                s.key: {"state": s.state, "since": now, "short": s.short} for s in sessions
+            }
+            self.watch["_ci"] = dict(ci)
+            self._watch_baselined = True
+            self.save_state()
+            log.info("watch baseline established over %d session(s)", len(sessions))
+            return []
+
+        for s in sessions:
+            prev = self.watch.get(s.key)
+            if prev is None:
+                # First sighting adopts the current state silently, so a
+                # restart never replays last night's completions.
+                self.watch[s.key] = {"state": s.state, "since": now, "short": s.short}
+                changed = True
+                continue
+            if prev.get("state") == "working" and s.state != "working":
+                minutes = max(1, int((now - (prev.get("since") or now)) / 60))
+                events.append({
+                    "kind": "done",
+                    # Stable across retries so a timed-out send that actually
+                    # landed is not delivered twice.
+                    "id": event_key(f"done:{s.key}:{int(prev.get('since') or now)}"),
+                    "short": s.short,
+                    "label": s.label,
+                    "minutes": minutes,
+                })
+            if prev.get("state") != s.state:
+                prev["since"] = now
+                changed = True
+            prev["state"] = s.state
+            prev["short"] = s.short
+
+        seen_ci = self.watch.setdefault("_ci", {})
+        for pr_key, state in ci.items():
+            prev_state = seen_ci.get(pr_key)
+            if prev_state is not None and prev_state != "failure" and state == "failure":
+                events.append({"kind": "ci", "id": event_key(f"ci:{pr_key}:{int(now)}"), "pr": pr_key})
+            if prev_state != state:
+                seen_ci[pr_key] = state
+                changed = True
+
+        if changed:
+            self.save_state()
+        return events
+
+    def notify(self, events: list[dict]) -> None:
+        # Anything that failed last time is retried here: poll_once() has
+        # already advanced the baseline, so a dropped event would never be
+        # regenerated.
+        queue = self.undelivered + events
+        self.undelivered = []
+        if not queue:
+            return
+        if not self.chat_id:
+            log.info("no chat to notify yet; %d event(s) held", len(queue))
+            self.undelivered = queue[-20:]
+            return
+        # Re-check the destination on every push: the whitelist can change, and
+        # a restored chat_id must not outlive the authorization that created it.
+        if not self.authorized(self.chat_owner or ""):
+            log.warning("notification destination is no longer authorized; dropped")
+            return
+        for e in queue:
+            if e["kind"] == "done":
+                card = cards_mod.notice(
+                    f"{e['short']} 跑完了",
+                    f"**{e['short']}** · {repo_of(e['label'])}\n用时约 {e['minutes']} 分钟\n\n"
+                    f"`/tail` 看结果，`/to {e['short']} 继续` 接着干",
+                    template="green",
+                )
+            else:
+                card = cards_mod.notice(
+                    "CI 挂了",
+                    f"**{e['pr']}** 的检查失败了\n\n`/wt` 看详情",
+                    template="red",
+                )
+            if not send_card(self.cmd, card, chat_id=self.chat_id, idempotency=e.get("id")):
+                self.undelivered.append(e)
+        if len(self.undelivered) > 20:
+            log.warning("dropping %d oldest undelivered notification(s)", len(self.undelivered) - 20)
+            self.undelivered = self.undelivered[-20:]
+
+    def status_reply(self) -> Reply:
+        body = self.guarded(self.cmd_status)
+        alerts = body.count("⚠")
+        card = cards_mod.notice(
+            "现在的情况",
+            body,
+            subtitle="有事情需要你看" if alerts else None,
+            template="orange" if alerts else "blue",
+        )
+        return _reply_card(card, fallback=body)
+
+    def nl_reply(self, text: str):
+        """Route a plain sentence. Returns None when it is not understandable."""
+        parsed = None
+        sessions: list[Session] = []
+        if self.llm.available():
+            try:
+                # Reading orca can fail independently of the model. Losing the
+                # session list must not make "上锁" impossible.
+                sessions = self.sessions()
+            except Exception:
+                log.exception("could not read sessions before routing")
+            try:
+                parsed = router.classify(self.llm, text, sessions)
+            except LLMError as exc:
+                log.warning("router unavailable: %s", exc)
+        if parsed is None:
+            parsed = router.fallback(text)
+            if parsed is None:
+                return None
+
+        intent = parsed["intent"]
+        if parsed.get("invalid_target"):
+            return Reply(
+                f"没找到会话 `{parsed['invalid_target']}`。发 `/sessions` 看看有哪些。",
+                markdown=True,
+            )
+        if intent == "status":
+            return self.status_reply()
+        if intent == "ask":
+            return Reply(self.guarded(self.cmd_ask, parsed["session"]), markdown=True)
+        if intent == "send":
+            return as_reply(self.guarded(self.cmd_say, parsed["session"], parsed["text"]))
+        if intent == "arm":
+            return Reply(self.cmd_arm(str(parsed["minutes"])), markdown=True)
+        if intent == "disarm":
+            return Reply(self.cmd_disarm(), markdown=True)
+        if intent == "help":
+            return Reply(HELP, markdown=True)
+        return None
 
     def handle(self, ev: dict) -> str | None:
         # Our own replies can echo back in group chats; never answer a bot.
@@ -759,6 +1391,10 @@ class Bridge:
         if self._already_seen(message_id):
             log.debug("duplicate delivery ignored: %s", message_id)
             return None
+
+        # One message may read the session list several times (route it, then
+        # act on it). Cache for the duration of the message only.
+        self._session_cache = None
 
         text = normalize(ev.get("content") or "")
         sender = ev.get("sender_id") or ""
@@ -782,6 +1418,21 @@ class Bridge:
         if not self.authorized(sender):
             log.warning("rejected unauthorized sender %s", sender)
             return "⛔ 你的 open_id 不在白名单里。发 /id 查看，把它加进 config.json 的 allowed_open_ids。"
+
+        # Only now may this chat receive proactive notifications. Setting it
+        # before the check let a rejected sender become the destination and
+        # made every later push a disclosure to them.
+        # Only private chats may become the notification destination. A group
+        # would send workspace events to every member, most of whom are not in
+        # allowed_open_ids.
+        if (chat_id and ev.get("chat_type") == "p2p"
+                and (chat_id != self.chat_id or sender != self.chat_owner)):
+            # Refresh the owner whenever an authorized sender writes here: a
+            # chat can outlive the account that first authorized it, and
+            # keeping the old owner would silence notifications forever.
+            self.chat_id = chat_id
+            self.chat_owner = sender
+            self.save_state()
 
         parts = text.split(None, 1)
         head = parts[0].lower()
@@ -807,6 +1458,8 @@ class Bridge:
             return Reply(self.guarded(self.cmd_use, arg), markdown=True)
         if head == "/sessions":
             return Reply(self.guarded(self.cmd_sessions), markdown=True)
+        if head == "/status":
+            return self.status_reply()
         if head == "/to":
             return Reply(self.guarded(self.cmd_to, arg), markdown=True)
         if head == "/arm":
@@ -814,19 +1467,35 @@ class Bridge:
         if head == "/disarm":
             return Reply(self.cmd_disarm(), markdown=True)
         if head == "/send":
-            return Reply(self.guarded(self.cmd_send, arg), markdown=True)
+            return as_reply(self.guarded(self.cmd_send, arg))
+
+        nl = self.nl_reply(text)
+        if nl is not None:
+            return nl
 
         self.count += 1
         return (
-            f"收到 #{self.count}：{text}\n\n"
-            "（还没接转发。先用 `/arm` + `/send <文本>`，或 `/help`。）"
+            "没太听懂。可以试试：\n"
+            "「现在什么情况」\n"
+            "「myapp 在干嘛」\n"
+            "「让 my-video 继续」\n\n"
+            "`/help` 看全部命令。"
         )
 
     def reply(self, message_id: str, text: str | Reply) -> None:
         if not message_id or text is None:
             return
-        markdown = text.markdown if isinstance(text, Reply) else False
-        body = text.text if isinstance(text, Reply) else text
+        markdown = False
+        body = text
+        if isinstance(text, Reply):
+            markdown = text.markdown
+            body = text.text
+            if text.card and send_card(self.cmd, text.card, message_id=message_id, idempotency=message_id):
+                return
+            if text.card:
+                log.warning("card failed; falling back to plain text")
+        if not (body or "").strip():
+            return
         send_reply(
             self.cmd,
             message_id,
@@ -948,26 +1617,100 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, OSError):
             pass
 
-    consumer = EventConsumer(cmd, cfg.get("event_key", DEFAULT_EVENT_KEY))
-    consumer.start()
+    msg_consumer = EventConsumer(cmd, cfg.get("event_key", DEFAULT_EVENT_KEY))
+    msg_consumer.start()
+
+    # The card callback runs as its own `event consume` process: one EventKey
+    # per process is the supported shape. If the app has not enabled the
+    # callback in the console the consumer still starts but stays silent, so a
+    # failure here must not take the message loop down with it.
+    card_consumer: EventConsumer | None = None
+    card_key = cfg.get("card_event_key", "card.action.trigger")
+    if cfg.get("enable_cards", True):
+        card_consumer = EventConsumer(cmd, card_key)
+        try:
+            card_consumer.start(timeout=45)
+        except Exception as exc:
+            log.warning("card callbacks unavailable (%s); cards will send but not respond", exc)
+            try:
+                card_consumer.stop()  # a timed-out start leaves the child running
+            except Exception:
+                log.exception("could not stop the failed card consumer")
+            card_consumer = None
+
     bridge = Bridge(cfg, cmd)
+    bridge.cards_available = card_consumer is not None
     log.info("bridge ready; waiting for messages")
 
+    if cfg.get("notify_enabled", True):
+        interval = float(cfg.get("notify_interval_seconds", 30))
+
+        def watch_loop() -> None:
+            while not stop.wait(interval):
+                events: list[dict] = []
+                try:
+                    events = bridge.poll_once()
+                except Exception:
+                    log.exception("watch poll failed")
+                # Retry queued notifications even when polling is broken: an
+                # Orca outage must not also silence the Feishu side.
+                try:
+                    bridge.notify(events)
+                except Exception:
+                    log.exception("watch notify failed")
+
+        threading.Thread(target=watch_loop, name="watch", daemon=True).start()
+        log.info("watching for completions every %.0fs", interval)
+
+    inbox: queue.Queue = queue.Queue()
+
+    def pump(c: EventConsumer, label: str) -> None:
+        try:
+            for ev in c.events():
+                inbox.put((label, ev))
+                if stop.is_set():
+                    break
+        except Exception:
+            log.exception("consumer %s stopped unexpectedly", label)
+        if not stop.is_set():
+            # The consumer died on its own. Tell the main loop, or it sits on
+            # an empty queue forever: no messages, no exit, nothing for a
+            # supervisor to restart.
+            inbox.put(("__eof__", label))
+
+    consumers = [("message", msg_consumer)]
+    if card_consumer:
+        consumers.append(("card", card_consumer))
+    for label, c in consumers:
+        threading.Thread(target=pump, args=(c, label), name=f"pump-{label}", daemon=True).start()
+
     try:
-        for ev in consumer.events():
-            if stop.is_set():
+        while not stop.is_set():
+            try:
+                label, ev = inbox.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if label == "__eof__":
+                log.error("%s consumer ended; stopping so a supervisor can restart the bridge", ev)
+                stop.set()
                 break
             try:
-                text = bridge.handle(ev)
+                if label == "card":
+                    bridge.handle_card(ev)
+                    continue
+                reply = bridge.handle(ev)
+                if reply:
+                    bridge.reply(ev.get("message_id") or ev.get("id") or "", reply)
             except Exception:
-                log.exception("handler crashed on event")
-                text = "⚠️ 桥接内部错误，详情见 logs/bridge.log"
-            if text:
-                bridge.reply(ev.get("message_id") or ev.get("id") or "", text)
-            if consumer.proc and consumer.proc.poll() is not None:
-                break
+                log.exception("handler crashed on %s event", label)
+                if label == "message":
+                    bridge.reply(
+                        ev.get("message_id") or ev.get("id") or "",
+                        "⚠️ 桥接内部错误，详情见 logs/bridge.log",
+                    )
     finally:
-        consumer.stop()
+        for _, c in consumers:
+            c.stop()
 
     log.info("bridge stopped")
     return 0

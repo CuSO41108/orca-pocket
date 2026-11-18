@@ -5,5 +5,18 @@
   "max_reply_chars": 4000,
   "event_key": "im.message.receive_v1",
   "log_file": "logs/bridge.log",
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "llm": {
+    "enabled": true,
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "DEEPSEEK_API_KEY"
+  },
+  "confirm_writes": true,
+  "pending_ttl_seconds": 300,
+  "enable_cards": true,
+  "card_event_key": "card.action.trigger",
+  "notify_enabled": true,
+  "notify_interval_seconds": 30
 }

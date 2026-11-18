@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 SKIP_DIRS = {".git", "logs", "__pycache__", ".venv", "node_modules"}
 # Local-only files: they are *supposed* to hold real ids. The danger is
 # publishing them, which check_tracked_config() covers separately.
-SKIP_FILES = {"config.json", "privacy.local.txt"}
+SKIP_FILES = {"config.json", "privacy.local.txt", "state.json", "state.json.tmp"}
 
 # Anything that looks like real Feishu data rather than a placeholder.
 PATTERNS = {
